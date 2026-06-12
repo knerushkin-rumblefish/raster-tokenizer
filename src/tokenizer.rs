@@ -2,6 +2,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 
 use raster::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -124,6 +125,18 @@ struct VocabLookupView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
+struct LookupState {
+    lo: usize,
+    hi: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
+struct LookupResult {
+    found: bool,
+    id: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
 struct MergeLookupView {
     merge_lookup: Vec<GemmaBpeMergeLookupEntry>,
 }
@@ -146,6 +159,33 @@ struct TokenizerViews {
 enum InputSegment {
     Special(GemmaAddedToken),
     Text(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
+struct PromptAtom {
+    byte_start: usize,
+    byte_end: usize,
+    text: String,
+    window: String,
+    is_end: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
+struct SegmentInputState {
+    cursor: usize,
+    pending_text: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
+struct SegmentedInput {
+    segments: Vec<RasterInputSegment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
+struct RasterInputSegment {
+    is_special: bool,
+    special: GemmaAddedToken,
+    text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
@@ -180,7 +220,8 @@ struct BpeMergeSelection {
     candidate: GemmaBpeMergeCandidate,
 }
 
-fn validate_tokenizer_metadata_impl(metadata: &GemmaTokenizerMetadata) -> Result<()> {
+#[tile]
+fn validate_tokenizer_metadata_impl(metadata: GemmaTokenizerMetadata) -> Result<()> {
     if metadata.invert {
         return Err("tokenizer pre-tokenizer invert mode is not supported".into());
     }
@@ -197,38 +238,163 @@ fn validate_tokenizer_metadata_impl(metadata: &GemmaTokenizerMetadata) -> Result
     Ok(())
 }
 
-fn lookup_token_id_impl(tokenizer: &VocabLookupView, token: &str) -> Option<u32> {
-    tokenizer
-        .token_lookup
-        .binary_search_by(|entry| entry.token.as_str().cmp(token))
-        .ok()
-        .map(|idx| tokenizer.token_lookup[idx].id)
+#[tile(kind = recur)]
+fn lookup_recur(
+    input: RecurInput<GemmaTokenIdEntry>,
+    state: RecurState<LookupState>,
+    output: RecurOutput<LookupResult>,
+    entries: Vec<GemmaTokenIdEntry>,
+    token: String,
+) -> RecurControl<(RecurState<LookupState>, RecurOutput<LookupResult>)> {
+    let _ = input.value();
+    let mut state = state;
+    let mut output = output;
+
+    if input.is_first() {
+        state.hi = entries.len();
+    }
+
+    if state.lo >= state.hi {
+        output.found().set(false);
+        output.id().set(0);
+        return RecurControl::Break((state, output));
+    }
+
+    let mid = state.lo + (state.hi - state.lo) / 2;
+    match entries[mid].token.as_str().cmp(&token) {
+        Ordering::Equal => {
+            output.found().set(true);
+            output.id().set(entries[mid].id);
+            RecurControl::Break((state, output))
+        }
+        Ordering::Less => {
+            state.lo = mid + 1;
+            RecurControl::Continue((state, output))
+        }
+        Ordering::Greater => {
+            state.hi = mid;
+            RecurControl::Continue((state, output))
+        }
+    }
 }
 
-fn require_token_id_impl(tokenizer: &VocabLookupView, token: &str) -> Result<u32> {
-    lookup_token_id_impl(tokenizer, token)
-        .ok_or_else(|| alloc::format!("tokenizer is missing required token '{}'", token))
+#[tile]
+fn lookup_result_to_option(result: LookupResult) -> Option<u32> {
+    if result.found {
+        Some(result.id)
+    } else {
+        None
+    }
+}
+
+fn lookup_token_id_native(entries: &[GemmaTokenIdEntry], token: &str) -> Option<u32> {
+    let mut lo = 0usize;
+    let mut hi = entries.len();
+
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match entries[mid].token.as_str().cmp(token) {
+            Ordering::Equal => return Some(entries[mid].id),
+            Ordering::Less => lo = mid + 1,
+            Ordering::Greater => hi = mid,
+        }
+    }
+
+    None
+}
+
+#[sequence]
+fn lookup_token_id_impl(vocab: VocabLookupView, token: String) -> Option<u32> {
+    let token_lookup = select!(Vec<GemmaTokenIdEntry>, vocab.token_lookup);
+    let result = call_recur!(
+        tile = lookup_recur,
+        input = token_lookup.clone(),
+        state = LookupState { lo: 0, hi: 0 },
+        output = new!(LookupResult),
+        args = (token_lookup, token,)
+    );
+
+    call!(lookup_result_to_option, result)
+}
+
+#[tile]
+fn token_lookup_len(token_lookup: Vec<GemmaTokenIdEntry>) -> usize {
+    token_lookup.len()
+}
+
+#[tile]
+fn create_vocab_lookup_view(token_lookup: Vec<GemmaTokenIdEntry>) -> VocabLookupView {
+    VocabLookupView { token_lookup }
+}
+
+#[sequence]
+fn require_token_id_impl(token_lookup: Vec<GemmaTokenIdEntry>, token: String) -> Result<u32> {
+    let vocab = call!(create_vocab_lookup_view, token_lookup);
+    let token_id = call_seq!(lookup_token_id_impl, vocab, token.clone());
+    let required = call!(require_token_id_tile, token_id, token)?;
+    Ok(required)
 }
 
 fn segment_tokenizer_view_from_parts(special_tokens: Vec<GemmaAddedToken>) -> SegmentTokenizerView {
     SegmentTokenizerView { special_tokens }
 }
 
+#[tile]
+fn create_encoding_tokenizer_view(
+    metadata: GemmaTokenizerMetadata,
+    token_lookup: Vec<GemmaTokenIdEntry>,
+    merge_lookup: Vec<GemmaBpeMergeLookupEntry>,
+    unk_id: u32,
+) -> EncodingTokenizerView {
+    EncodingTokenizerView {
+        metadata,
+        vocab: VocabLookupView { token_lookup },
+        merges: MergeLookupView { merge_lookup },
+        unk_id,
+    }
+}
+
+#[sequence]
 fn encoding_tokenizer_view_from_parts(
     metadata: GemmaTokenizerMetadata,
     token_lookup: Vec<GemmaTokenIdEntry>,
     merge_lookup: Vec<GemmaBpeMergeLookupEntry>,
 ) -> Result<EncodingTokenizerView> {
-    validate_tokenizer_metadata_impl(&metadata)?;
-    let vocab = VocabLookupView { token_lookup };
-    let unk_id = require_token_id_impl(&vocab, metadata.unk_token.as_str())?;
+    call!(validate_tokenizer_metadata_impl, metadata.clone())?;
 
-    Ok(EncodingTokenizerView {
+    let token = select!(String, metadata.clone().unk_token);
+    let unk_id = call_seq!(require_token_id_impl, token_lookup.clone(), token)?;
+
+    Ok(call!(
+        create_encoding_tokenizer_view,
         metadata,
-        vocab,
-        merges: MergeLookupView { merge_lookup },
+        token_lookup,
+        merge_lookup,
+        unk_id
+    ))
+}
+
+fn encoding_tokenizer_view_from_parts_native(
+    metadata: GemmaTokenizerMetadata,
+    token_lookup: Vec<GemmaTokenIdEntry>,
+    merge_lookup: Vec<GemmaBpeMergeLookupEntry>,
+) -> Result<EncodingTokenizerView> {
+    validate_tokenizer_metadata_impl(metadata.clone())?;
+
+    let unk_id = lookup_token_id_native(token_lookup.as_slice(), metadata.unk_token.as_str())
+        .ok_or_else(|| {
+            alloc::format!(
+                "tokenizer is missing required token '{}'",
+                metadata.unk_token
+            )
+        })?;
+
+    Ok(create_encoding_tokenizer_view(
+        metadata,
+        token_lookup,
+        merge_lookup,
         unk_id,
-    })
+    ))
 }
 
 fn select_tokenizer_views_impl(tokenizer: GemmaTokenizer) -> Result<TokenizerViews> {
@@ -242,7 +408,7 @@ fn select_tokenizer_views_impl(tokenizer: GemmaTokenizer) -> Result<TokenizerVie
 
     Ok(TokenizerViews {
         segmenter: segment_tokenizer_view_from_parts(special_tokens),
-        encoder: encoding_tokenizer_view_from_parts(metadata, token_lookup, merge_lookup)?,
+        encoder: encoding_tokenizer_view_from_parts_native(metadata, token_lookup, merge_lookup)?,
     })
 }
 
@@ -312,6 +478,122 @@ fn segment_input_impl(tokenizer: &SegmentTokenizerView, input: &str) -> Vec<Inpu
     }
 
     segments
+}
+
+fn empty_special_segment() -> GemmaAddedToken {
+    GemmaAddedToken {
+        id: 0,
+        content: String::new(),
+        single_word: false,
+        lstrip: false,
+        rstrip: false,
+        normalized: false,
+        special: false,
+    }
+}
+
+#[tile]
+fn atomize_prompt_tile(tokenizer: SegmentTokenizerView, input: String) -> Vec<PromptAtom> {
+    let max_special_len = tokenizer
+        .special_tokens
+        .iter()
+        .map(|token| token.content.len())
+        .max()
+        .unwrap_or(0);
+
+    let mut atoms = Vec::new();
+    for (byte_start, ch) in input.char_indices() {
+        let byte_end = byte_start + ch.len_utf8();
+        let mut window_end = byte_start;
+        if max_special_len > 0 {
+            let suffix = input
+                .get(byte_start..)
+                .expect("atomization should only start on valid UTF-8 boundaries");
+            for (offset, ch) in suffix.char_indices() {
+                let next = byte_start + offset + ch.len_utf8();
+                window_end = next;
+                if next - byte_start >= max_special_len {
+                    break;
+                }
+            }
+        }
+
+        atoms.push(PromptAtom {
+            byte_start,
+            byte_end,
+            text: alloc::format!("{ch}"),
+            window: String::from(
+                input
+                    .get(byte_start..window_end)
+                    .expect("atom windows should only slice valid UTF-8 boundaries"),
+            ),
+            is_end: false,
+        });
+    }
+
+    atoms.push(PromptAtom {
+        byte_start: input.len(),
+        byte_end: input.len(),
+        text: String::new(),
+        window: String::new(),
+        is_end: true,
+    });
+
+    atoms
+}
+
+#[tile(kind = recur)]
+fn segment_input_recur(
+    input: RecurInput<PromptAtom>,
+    state: RecurState<SegmentInputState>,
+    output: RecurOutput<SegmentedInput>,
+    tokenizer: SegmentTokenizerView,
+) -> RecurControl<(RecurState<SegmentInputState>, RecurOutput<SegmentedInput>)> {
+    let atom = input.into_value();
+    let mut state = state;
+    let mut output = output;
+
+    if atom.byte_start != state.cursor {
+        return RecurControl::Continue((state, output));
+    }
+
+    if atom.is_end {
+        if !state.pending_text.is_empty() {
+            output.segments().push(RasterInputSegment {
+                is_special: false,
+                special: empty_special_segment(),
+                text: core::mem::take(&mut state.pending_text),
+            });
+        }
+        return RecurControl::Break((state, output));
+    }
+
+    if let Some(special) = tokenizer
+        .special_tokens
+        .iter()
+        .find(|token| atom.window.starts_with(token.content.as_str()))
+        .cloned()
+    {
+        if !state.pending_text.is_empty() {
+            output.segments().push(RasterInputSegment {
+                is_special: false,
+                special: empty_special_segment(),
+                text: core::mem::take(&mut state.pending_text),
+            });
+        }
+
+        state.cursor = atom.byte_start + special.content.len();
+        output.segments().push(RasterInputSegment {
+            is_special: true,
+            special,
+            text: String::new(),
+        });
+    } else {
+        state.pending_text.push_str(atom.text.as_str());
+        state.cursor = atom.byte_end;
+    }
+
+    RecurControl::Continue((state, output))
 }
 
 fn normalize_text_segment_impl(
@@ -402,7 +684,7 @@ fn resolve_piece_impl(
     metadata: &GemmaTokenizerMetadata,
     piece: String,
 ) -> Vec<ResolvedTokenFragment> {
-    if let Some(id) = lookup_token_id_impl(tokenizer, piece.as_str()) {
+    if let Some(id) = lookup_token_id_native(tokenizer.token_lookup.as_slice(), piece.as_str()) {
         return alloc::vec![ResolvedTokenFragment::Token(EncodedToken {
             piece,
             id,
@@ -414,7 +696,9 @@ fn resolve_piece_impl(
         let mut fragments = Vec::new();
         for byte in piece.as_bytes() {
             let byte_piece = alloc::format!("<0x{:02X}>", byte);
-            if let Some(id) = lookup_token_id_impl(tokenizer, byte_piece.as_str()) {
+            if let Some(id) =
+                lookup_token_id_native(tokenizer.token_lookup.as_slice(), byte_piece.as_str())
+            {
                 fragments.push(ResolvedTokenFragment::Token(EncodedToken {
                     piece: byte_piece,
                     id,
@@ -540,17 +824,37 @@ fn build_segment_tokenizer_view(special_tokens: Vec<GemmaAddedToken>) -> Segment
 }
 
 #[tile]
+fn require_token_id_tile(token_id: Option<u32>, token: String) -> Result<u32> {
+    token_id.ok_or_else(|| alloc::format!("tokenizer is missing required token '{}'", token))
+}
+
+#[sequence]
 fn build_encoding_tokenizer_view(
     metadata: GemmaTokenizerMetadata,
     token_lookup: Vec<GemmaTokenIdEntry>,
     merge_lookup: Vec<GemmaBpeMergeLookupEntry>,
 ) -> Result<EncodingTokenizerView> {
-    encoding_tokenizer_view_from_parts(metadata, token_lookup, merge_lookup)
+    call_seq!(
+        encoding_tokenizer_view_from_parts,
+        metadata,
+        token_lookup,
+        merge_lookup
+    )
 }
 
 #[tile]
-fn segment_input_tile(tokenizer: SegmentTokenizerView, input: String) -> Vec<InputSegment> {
-    segment_input_impl(&tokenizer, input.as_str())
+fn segmented_input_segments_tile(segmented: SegmentedInput) -> Vec<InputSegment> {
+    segmented
+        .segments
+        .into_iter()
+        .map(|segment| {
+            if segment.is_special {
+                InputSegment::Special(segment.special)
+            } else {
+                InputSegment::Text(segment.text)
+            }
+        })
+        .collect()
 }
 
 #[tile]
@@ -572,7 +876,8 @@ fn select_encoding_view(tokenizer: GemmaTokenizer) -> Result<EncodingTokenizerVi
     let metadata = select!(GemmaTokenizerMetadata, tokenizer.clone().metadata);
     let token_lookup = select!(Vec<GemmaTokenIdEntry>, tokenizer.clone().token_lookup);
     let merge_lookup = select!(Vec<GemmaBpeMergeLookupEntry>, tokenizer.merge_lookup);
-    call!(
+
+    call_seq!(
         build_encoding_tokenizer_view,
         metadata,
         token_lookup,
@@ -583,14 +888,35 @@ fn select_encoding_view(tokenizer: GemmaTokenizer) -> Result<EncodingTokenizerVi
 #[sequence]
 fn segment_prompt(tokenizer: GemmaTokenizer, input: String) -> Vec<InputSegment> {
     let segmenter = call_seq!(select_segmenter_view, tokenizer);
-    call!(segment_input_tile, segmenter, input)
+    let atoms = call!(atomize_prompt_tile, segmenter.clone(), input);
+    let segmented = call_recur!(
+        tile = segment_input_recur,
+        input = atoms,
+        state = SegmentInputState {
+            cursor: 0,
+            pending_text: String::new(),
+        },
+        output = new!(SegmentedInput),
+        args = (segmenter,)
+    );
+    call!(segmented_input_segments_tile, segmented)
 }
 
 #[sequence]
-pub fn encode_prompt_raster(tokenizer: GemmaTokenizer, input: String) -> Result<EncodedPrompt> {
+pub fn encode_prompt_raster_sequence(
+    tokenizer: GemmaTokenizer,
+    input: String,
+) -> Result<EncodedPrompt> {
     let segments = call_seq!(segment_prompt, tokenizer.clone(), input);
     let encoder = call_seq!(select_encoding_view, tokenizer)?;
-    call!(encode_segments_tile, encoder, segments)
+    let prompt = call!(encode_segments_tile, encoder, segments)?;
+    Ok(prompt)
+}
+
+pub fn encode_prompt_raster(tokenizer: GemmaTokenizer, input: String) -> Result<EncodedPrompt> {
+    materialize_auth_result::<EncodedPrompt, _>(
+        __raster_sequence_auth_encode_prompt_raster_sequence(tokenizer, input),
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
