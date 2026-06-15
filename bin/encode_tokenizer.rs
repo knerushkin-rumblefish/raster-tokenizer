@@ -252,7 +252,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn main() -> Result<()> {
-    const DEFAULT_PROMPT: &str = "Over the last couple of months, a new programming paradigm has been rapidly gaining traction within Ethereum's frontier research and development circles, and many other corners of computing: writing code directly either in very low-level languages (eg. EVM bytecode, assembly language) or in Lean, and verifying its correctness with automatically-checkable mathematical proofs written in Lean.";
+    const DEFAULT_PROMPT: &str = "How to create ZKP of LLM inference?";
 
     let args: Vec<String> = std::env::args().collect();
     let out_dir = PathBuf::from(args.get(1).cloned().unwrap_or_else(|| ".".to_string()));
