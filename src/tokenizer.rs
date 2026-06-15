@@ -119,6 +119,12 @@ struct SegmentTokenizerView {
     special_tokens: Vec<GemmaAddedToken>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
+struct SpecialSegment {
+    id: u32,
+    piece: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
 struct VocabLookupView {
     token_lookup: Vec<GemmaTokenIdEntry>,
@@ -157,8 +163,16 @@ struct TokenizerViews {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 enum InputSegment {
-    Special(GemmaAddedToken),
+    Special(SpecialSegment),
     Text(String),
+}
+
+impl raster::core::input::Selectable for InputSegment {
+    fn schema() -> raster::core::input::SchemaNode {
+        raster::core::input::SchemaNode::Leaf {
+            type_name: "InputSegment".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
@@ -171,9 +185,43 @@ struct PromptAtom {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
+struct PromptChar {
+    byte_start: usize,
+    byte_end: usize,
+    text: String,
+    is_end: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
 struct SegmentInputState {
     cursor: usize,
     pending_text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
+struct MaxSpecialTokenLenState {
+    max_len: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct AtomizePromptState {
+    pending: Vec<PendingPromptAtom>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingPromptAtom {
+    byte_start: usize,
+    byte_end: usize,
+    text: String,
+    window: String,
+}
+
+//TODO: currently recuce output is required to have those ugly wrappers just to generate schema to
+//be able to use atoms.push like operations. This should be part of internal raster Vec type (same
+//for String)
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
+struct PromptAtoms {
+    atoms: Vec<PromptAtom>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
@@ -184,8 +232,30 @@ struct SegmentedInput {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
 struct RasterInputSegment {
     is_special: bool,
-    special: GemmaAddedToken,
+    special: SpecialSegment,
     text: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
+struct InputSegments {
+    segments: Vec<InputSegment>,
+}
+
+#[tile(kind = recur)]
+fn raster_input_segment_recur(
+    input: RecurInput<RasterInputSegment>,
+    output: RecurOutput<InputSegments>,
+) -> RecurOutput<InputSegments> {
+    let mut output = output;
+    let segment = input.into_value();
+
+    if segment.is_special {
+        output.segments().push(InputSegment::Special(segment.special));
+    } else {
+        output.segments().push(InputSegment::Text(segment.text));
+    }
+
+    output
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
@@ -339,6 +409,24 @@ fn segment_tokenizer_view_from_parts(special_tokens: Vec<GemmaAddedToken>) -> Se
     SegmentTokenizerView { special_tokens }
 }
 
+fn special_segment_from_token(token: &GemmaAddedToken) -> SpecialSegment {
+    SpecialSegment {
+        id: token.id,
+        piece: token.content.clone(),
+    }
+}
+
+#[tile(kind = recur)]
+fn max_special_token_len_recur(
+    input: RecurInput<GemmaAddedToken>,
+    state: RecurState<MaxSpecialTokenLenState>,
+) -> RecurState<MaxSpecialTokenLenState> {
+    let mut state = state;
+
+    state.max_len = state.max_len.max(input.value().content.len());
+    state
+}
+
 #[tile]
 fn create_encoding_tokenizer_view(
     metadata: GemmaTokenizerMetadata,
@@ -412,17 +500,16 @@ fn select_tokenizer_views_impl(tokenizer: GemmaTokenizer) -> Result<TokenizerVie
     })
 }
 
-fn longest_special_token_at_impl(
-    tokenizer: &SegmentTokenizerView,
+fn longest_special_token_at_impl<'a>(
+    tokenizer: &'a SegmentTokenizerView,
     input: &str,
     byte_idx: usize,
-) -> Option<GemmaAddedToken> {
+) -> Option<&'a GemmaAddedToken> {
     let suffix = input.get(byte_idx..)?;
     tokenizer
         .special_tokens
         .iter()
         .find(|token| suffix.starts_with(token.content.as_str()))
-        .cloned()
 }
 
 fn next_special_token_start_impl(
@@ -465,7 +552,7 @@ fn segment_input_impl(tokenizer: &SegmentTokenizerView, input: &str) -> Vec<Inpu
     while cursor < input.len() {
         if let Some(special) = longest_special_token_at_impl(tokenizer, input, cursor) {
             cursor += special.content.len();
-            segments.push(InputSegment::Special(special));
+            segments.push(InputSegment::Special(special_segment_from_token(special)));
             continue;
         }
 
@@ -480,66 +567,109 @@ fn segment_input_impl(tokenizer: &SegmentTokenizerView, input: &str) -> Vec<Inpu
     segments
 }
 
-fn empty_special_segment() -> GemmaAddedToken {
-    GemmaAddedToken {
-        id: 0,
-        content: String::new(),
-        single_word: false,
-        lstrip: false,
-        rstrip: false,
-        normalized: false,
-        special: false,
-    }
-}
-
+// TODO: current raster do not provide some recur over String because only collection he know is
+// Vec, in order to use String as recur argument raster need to provide API for iter over String
 #[tile]
-fn atomize_prompt_tile(tokenizer: SegmentTokenizerView, input: String) -> Vec<PromptAtom> {
-    let max_special_len = tokenizer
-        .special_tokens
-        .iter()
-        .map(|token| token.content.len())
-        .max()
-        .unwrap_or(0);
-
-    let mut atoms = Vec::new();
+fn prompt_chars_tile(input: String) -> Vec<PromptChar> {
+    let mut chars = Vec::new();
     for (byte_start, ch) in input.char_indices() {
-        let byte_end = byte_start + ch.len_utf8();
-        let mut window_end = byte_start;
-        if max_special_len > 0 {
-            let suffix = input
-                .get(byte_start..)
-                .expect("atomization should only start on valid UTF-8 boundaries");
-            for (offset, ch) in suffix.char_indices() {
-                let next = byte_start + offset + ch.len_utf8();
-                window_end = next;
-                if next - byte_start >= max_special_len {
-                    break;
-                }
-            }
-        }
-
-        atoms.push(PromptAtom {
+        chars.push(PromptChar {
             byte_start,
-            byte_end,
+            byte_end: byte_start + ch.len_utf8(),
             text: alloc::format!("{ch}"),
-            window: String::from(
-                input
-                    .get(byte_start..window_end)
-                    .expect("atom windows should only slice valid UTF-8 boundaries"),
-            ),
             is_end: false,
         });
     }
 
-    atoms.push(PromptAtom {
+    chars.push(PromptChar {
         byte_start: input.len(),
         byte_end: input.len(),
         text: String::new(),
-        window: String::new(),
         is_end: true,
     });
 
-    atoms
+    chars
+}
+
+fn prompt_atom_from_pending(pending: PendingPromptAtom) -> PromptAtom {
+    PromptAtom {
+        byte_start: pending.byte_start,
+        byte_end: pending.byte_end,
+        text: pending.text,
+        window: pending.window,
+        is_end: false,
+    }
+}
+
+#[tile(kind = recur)]
+fn atomize_prompt_recur(
+    input: RecurInput<PromptChar>,
+    state: RecurState<AtomizePromptState>,
+    output: RecurOutput<PromptAtoms>,
+    max_special_len: usize,
+) -> RecurControl<(RecurState<AtomizePromptState>, RecurOutput<PromptAtoms>)> {
+    let current = input.into_value();
+    let mut state = state;
+    let mut output = output;
+
+    if current.is_end {
+        for pending in state.pending.drain(..) {
+            output.atoms().push(prompt_atom_from_pending(pending));
+        }
+        output.atoms().push(PromptAtom {
+            byte_start: current.byte_start,
+            byte_end: current.byte_end,
+            text: String::new(),
+            window: String::new(),
+            is_end: true,
+        });
+        return RecurControl::Break((state, output));
+    }
+
+    if max_special_len == 0 {
+        output.atoms().push(PromptAtom {
+            byte_start: current.byte_start,
+            byte_end: current.byte_end,
+            text: current.text,
+            window: String::new(),
+            is_end: false,
+        });
+        return RecurControl::Continue((state, output));
+    }
+
+    let mut next_pending = Vec::new();
+    for mut pending in core::mem::take(&mut state.pending) {
+        if pending.window.len() < max_special_len {
+            pending.window.push_str(current.text.as_str());
+        }
+
+        if pending.window.len() >= max_special_len {
+            output.atoms().push(prompt_atom_from_pending(pending));
+        } else {
+            next_pending.push(pending);
+        }
+    }
+    state.pending = next_pending;
+
+    let current_window = current.text.clone();
+    if current_window.len() >= max_special_len {
+        output.atoms().push(PromptAtom {
+            byte_start: current.byte_start,
+            byte_end: current.byte_end,
+            text: current.text,
+            window: current_window,
+            is_end: false,
+        });
+    } else {
+        state.pending.push(PendingPromptAtom {
+            byte_start: current.byte_start,
+            byte_end: current.byte_end,
+            text: current.text,
+            window: current_window,
+        });
+    }
+
+    RecurControl::Continue((state, output))
 }
 
 #[tile(kind = recur)]
@@ -547,7 +677,7 @@ fn segment_input_recur(
     input: RecurInput<PromptAtom>,
     state: RecurState<SegmentInputState>,
     output: RecurOutput<SegmentedInput>,
-    tokenizer: SegmentTokenizerView,
+    special_tokens: Vec<GemmaAddedToken>,
 ) -> RecurControl<(RecurState<SegmentInputState>, RecurOutput<SegmentedInput>)> {
     let atom = input.into_value();
     let mut state = state;
@@ -561,23 +691,21 @@ fn segment_input_recur(
         if !state.pending_text.is_empty() {
             output.segments().push(RasterInputSegment {
                 is_special: false,
-                special: empty_special_segment(),
+                special: SpecialSegment::default(),
                 text: core::mem::take(&mut state.pending_text),
             });
         }
         return RecurControl::Break((state, output));
     }
 
-    if let Some(special) = tokenizer
-        .special_tokens
+    if let Some(special) = special_tokens
         .iter()
         .find(|token| atom.window.starts_with(token.content.as_str()))
-        .cloned()
     {
         if !state.pending_text.is_empty() {
             output.segments().push(RasterInputSegment {
                 is_special: false,
-                special: empty_special_segment(),
+                special: SpecialSegment::default(),
                 text: core::mem::take(&mut state.pending_text),
             });
         }
@@ -585,7 +713,7 @@ fn segment_input_recur(
         state.cursor = atom.byte_start + special.content.len();
         output.segments().push(RasterInputSegment {
             is_special: true,
-            special,
+            special: special_segment_from_token(special),
             text: String::new(),
         });
     } else {
@@ -759,9 +887,9 @@ fn finalize_resolved_fragments_impl(
     output
 }
 
-fn encode_special_segment_impl(special: GemmaAddedToken) -> EncodedToken {
+fn encode_special_segment_impl(special: SpecialSegment) -> EncodedToken {
     EncodedToken {
-        piece: special.content,
+        piece: special.piece,
         id: special.id,
         special: true,
     }
@@ -812,17 +940,6 @@ fn encode_segments_impl(
     Ok(EncodedPrompt { tokens })
 }
 
-pub fn encode_prompt(tokenizer: GemmaTokenizer, input: String) -> Result<EncodedPrompt> {
-    let views = select_tokenizer_views_impl(tokenizer)?;
-    let segments = segment_input_impl(&views.segmenter, input.as_str());
-    encode_segments_impl(&views.encoder, segments)
-}
-
-#[tile]
-fn build_segment_tokenizer_view(special_tokens: Vec<GemmaAddedToken>) -> SegmentTokenizerView {
-    segment_tokenizer_view_from_parts(special_tokens)
-}
-
 #[tile]
 fn require_token_id_tile(token_id: Option<u32>, token: String) -> Result<u32> {
     token_id.ok_or_else(|| alloc::format!("tokenizer is missing required token '{}'", token))
@@ -843,32 +960,11 @@ fn build_encoding_tokenizer_view(
 }
 
 #[tile]
-fn segmented_input_segments_tile(segmented: SegmentedInput) -> Vec<InputSegment> {
-    segmented
-        .segments
-        .into_iter()
-        .map(|segment| {
-            if segment.is_special {
-                InputSegment::Special(segment.special)
-            } else {
-                InputSegment::Text(segment.text)
-            }
-        })
-        .collect()
-}
-
-#[tile]
 fn encode_segments_tile(
     tokenizer: EncodingTokenizerView,
     segments: Vec<InputSegment>,
 ) -> Result<EncodedPrompt> {
     encode_segments_impl(&tokenizer, segments)
-}
-
-#[sequence]
-fn select_segmenter_view(tokenizer: GemmaTokenizer) -> SegmentTokenizerView {
-    let special_tokens = select!(Vec<GemmaAddedToken>, tokenizer.special_tokens);
-    call!(build_segment_tokenizer_view, special_tokens)
 }
 
 #[sequence]
@@ -887,8 +983,25 @@ fn select_encoding_view(tokenizer: GemmaTokenizer) -> Result<EncodingTokenizerVi
 
 #[sequence]
 fn segment_prompt(tokenizer: GemmaTokenizer, input: String) -> Vec<InputSegment> {
-    let segmenter = call_seq!(select_segmenter_view, tokenizer);
-    let atoms = call!(atomize_prompt_tile, segmenter.clone(), input);
+    let special_tokens = select!(Vec<GemmaAddedToken>, tokenizer.special_tokens);
+    let max_special_len_state = call_recur!(
+        tile = max_special_token_len_recur,
+        input = special_tokens.clone(),
+        state = MaxSpecialTokenLenState { max_len: 0 },
+        args = ()
+    );
+    let max_special_len = select!(usize, max_special_len_state.max_len);
+    let prompt_chars = call!(prompt_chars_tile, input);
+    let atomized = call_recur!(
+        tile = atomize_prompt_recur,
+        input = prompt_chars,
+        state = AtomizePromptState {
+            pending: Vec::new(),
+        },
+        output = new!(PromptAtoms),
+        args = (max_special_len,)
+    );
+    let atoms = select!(Vec<PromptAtom>, atomized.atoms);
     let segmented = call_recur!(
         tile = segment_input_recur,
         input = atoms,
@@ -897,9 +1010,16 @@ fn segment_prompt(tokenizer: GemmaTokenizer, input: String) -> Vec<InputSegment>
             pending_text: String::new(),
         },
         output = new!(SegmentedInput),
-        args = (segmenter,)
+        args = (special_tokens,)
     );
-    call!(segmented_input_segments_tile, segmented)
+    let raster_segments = select!(Vec<RasterInputSegment>, segmented.segments);
+    let segments = call_recur!(
+        tile = raster_input_segment_recur,
+        input = raster_segments,
+        output = new!(InputSegments),
+        args = ()
+    );
+    select!(Vec<InputSegment>, segments.segments)
 }
 
 #[sequence]
@@ -937,7 +1057,9 @@ pub fn tokenizer_metadata(tokenizer: GemmaTokenizer) -> GemmaTokenizerMetadata {
 
 impl GemmaTokenizer {
     pub fn encode_prompt(&self, input: &str) -> Result<EncodedPrompt> {
-        crate::tokenizer::encode_prompt(self.clone(), String::from(input))
+        let views = select_tokenizer_views_impl(self.clone())?;
+        let segments = segment_input_impl(&views.segmenter, input);
+        encode_segments_impl(&views.encoder, segments)
     }
 }
 
@@ -1296,10 +1418,10 @@ mod tests {
     }
 
     #[test]
-    fn free_function_uses_native_path() {
+    fn method_uses_native_path() {
         let tokenizer = sample_encoding_tokenizer();
 
-        let encoded = encode_prompt(tokenizer, String::from("hello world")).unwrap();
+        let encoded = tokenizer.encode_prompt("hello world").unwrap();
 
         assert_eq!(encoded.token_pieces(), vec!["▁hello", "▁world"]);
         assert_eq!(encoded.token_ids(), vec![14, 15]);

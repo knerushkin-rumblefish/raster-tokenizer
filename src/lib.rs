@@ -6,8 +6,7 @@ extern crate std;
 pub mod tokenizer;
 
 pub use tokenizer::{
-    encode_prompt, encode_prompt_raster, EncodedPrompt, EncodedToken, GemmaAddedToken,
-    GemmaBpeMerge, GemmaBpeMergeCandidate, GemmaBpeMergeLookupEntry, GemmaDecodedToken,
-    GemmaDecoderMetadata, GemmaTokenIdEntry, GemmaTokenizer, GemmaTokenizerMetadata,
-    MinimalGemmaTokenizer,
+    encode_prompt_raster, EncodedPrompt, EncodedToken, GemmaAddedToken, GemmaBpeMerge,
+    GemmaBpeMergeCandidate, GemmaBpeMergeLookupEntry, GemmaDecodedToken, GemmaDecoderMetadata,
+    GemmaTokenIdEntry, GemmaTokenizer, GemmaTokenizerMetadata, MinimalGemmaTokenizer,
 };
