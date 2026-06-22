@@ -193,19 +193,23 @@ struct PromptChar {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
-struct SegmentProbe {
-    atom: PromptAtom,
-    token_content: String,
-    special: SpecialSegment,
-    has_special_token: bool,
-    is_first_for_atom: bool,
-    is_last_for_atom: bool,
+struct SegmentState {
+    cursor: usize,
+    pending_text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
-struct SegmentProbeState {
-    cursor: usize,
-    pending_text: String,
+struct SegmentAtomContext {
+    atom_byte_start: usize,
+    atom_byte_end: usize,
+    atom_text: String,
+    atom_window: String,
+    atom_is_end: bool,
+    at_cursor: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
+struct SpecialMatchState {
     matched: bool,
     matched_special: SpecialSegment,
     matched_len: usize,
@@ -238,39 +242,8 @@ struct PromptAtoms {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
-struct SegmentedInput {
-    segments: Vec<RasterInputSegment>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
-struct RasterInputSegment {
-    is_special: bool,
-    special: SpecialSegment,
-    text: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
 struct InputSegments {
     segments: Vec<InputSegment>,
-}
-
-#[tile(kind = recur)]
-fn raster_input_segment_recur(
-    input: RecurInput<RasterInputSegment>,
-    output: RecurOutput<InputSegments>,
-) -> RecurOutput<InputSegments> {
-    let mut output = output;
-    let segment = input.into_value();
-
-    if segment.is_special {
-        output
-            .segments()
-            .push(InputSegment::Special(segment.special));
-    } else {
-        output.segments().push(InputSegment::Text(segment.text));
-    }
-
-    output
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, raster::Selectable)]
@@ -305,7 +278,6 @@ struct BpeMergeSelection {
     candidate: GemmaBpeMergeCandidate,
 }
 
-#[tile]
 fn validate_tokenizer_metadata_impl(metadata: GemmaTokenizerMetadata) -> Result<()> {
     if metadata.invert {
         return Err("tokenizer pre-tokenizer invert mode is not supported".into());
@@ -321,6 +293,11 @@ fn validate_tokenizer_metadata_impl(metadata: GemmaTokenizerMetadata) -> Result<
     }
 
     Ok(())
+}
+
+#[tile]
+fn validate_tokenizer_metadata_tile(metadata: GemmaTokenizerMetadata) -> Result<()> {
+    validate_tokenizer_metadata_impl(metadata)
 }
 
 #[tile(kind = recur)]
@@ -432,41 +409,8 @@ fn special_segment_from_token(token: &GemmaAddedToken) -> SpecialSegment {
 }
 
 #[tile]
-fn segment_probes_tile(
-    atoms: Vec<PromptAtom>,
-    special_tokens: Vec<GemmaAddedToken>,
-) -> Vec<SegmentProbe> {
-    let mut probes = Vec::new();
-
-    if special_tokens.is_empty() {
-        for atom in atoms {
-            probes.push(SegmentProbe {
-                atom,
-                token_content: String::new(),
-                special: SpecialSegment::default(),
-                has_special_token: false,
-                is_first_for_atom: true,
-                is_last_for_atom: true,
-            });
-        }
-        return probes;
-    }
-
-    let last_token_idx = special_tokens.len() - 1;
-    for atom in atoms {
-        for (token_idx, token) in special_tokens.iter().enumerate() {
-            probes.push(SegmentProbe {
-                atom: atom.clone(),
-                token_content: token.content.clone(),
-                special: special_segment_from_token(token),
-                has_special_token: true,
-                is_first_for_atom: token_idx == 0,
-                is_last_for_atom: token_idx == last_token_idx,
-            });
-        }
-    }
-
-    probes
+fn materialize_special_tokens_tile(special_tokens: Vec<GemmaAddedToken>) -> Vec<GemmaAddedToken> {
+    special_tokens
 }
 
 #[tile(kind = recur)]
@@ -480,8 +424,7 @@ fn max_special_token_len_recur(
     state
 }
 
-#[tile]
-fn create_encoding_tokenizer_view(
+fn create_encoding_tokenizer_view_impl(
     metadata: GemmaTokenizerMetadata,
     token_lookup: Vec<GemmaTokenIdEntry>,
     merge_lookup: Vec<GemmaBpeMergeLookupEntry>,
@@ -495,19 +438,29 @@ fn create_encoding_tokenizer_view(
     }
 }
 
+#[tile]
+fn create_encoding_tokenizer_view_tile(
+    metadata: GemmaTokenizerMetadata,
+    token_lookup: Vec<GemmaTokenIdEntry>,
+    merge_lookup: Vec<GemmaBpeMergeLookupEntry>,
+    unk_id: u32,
+) -> EncodingTokenizerView {
+    create_encoding_tokenizer_view_impl(metadata, token_lookup, merge_lookup, unk_id)
+}
+
 #[sequence]
 fn encoding_tokenizer_view_from_parts(
     metadata: GemmaTokenizerMetadata,
     token_lookup: Vec<GemmaTokenIdEntry>,
     merge_lookup: Vec<GemmaBpeMergeLookupEntry>,
 ) -> Result<EncodingTokenizerView> {
-    call!(validate_tokenizer_metadata_impl, metadata.clone())?;
+    call!(validate_tokenizer_metadata_tile, metadata.clone())?;
 
     let token = select!(String, metadata.clone().unk_token);
     let unk_id = call_seq!(require_token_id_impl, token_lookup.clone(), token)?;
 
     Ok(call!(
-        create_encoding_tokenizer_view,
+        create_encoding_tokenizer_view_tile,
         metadata,
         token_lookup,
         merge_lookup,
@@ -530,7 +483,7 @@ fn encoding_tokenizer_view_from_parts_native(
             )
         })?;
 
-    Ok(create_encoding_tokenizer_view(
+    Ok(create_encoding_tokenizer_view_impl(
         metadata,
         token_lookup,
         merge_lookup,
@@ -725,75 +678,103 @@ fn atomize_prompt_recur(
     RecurControl::Continue((state, output))
 }
 
+#[tile]
+fn segment_atom_context_tile(atom: PromptAtom, state: SegmentState) -> SegmentAtomContext {
+    SegmentAtomContext {
+        atom_byte_start: atom.byte_start,
+        atom_byte_end: atom.byte_end,
+        atom_text: atom.text,
+        atom_window: atom.window,
+        atom_is_end: atom.is_end,
+        at_cursor: atom.byte_start == state.cursor,
+    }
+}
+
 #[tile(kind = recur)]
-fn segment_probe_recur(
-    input: RecurInput<SegmentProbe>,
-    state: RecurState<SegmentProbeState>,
-    output: RecurOutput<SegmentedInput>,
-) -> RecurControl<(RecurState<SegmentProbeState>, RecurOutput<SegmentedInput>)> {
-    let probe = input.into_value();
-    let atom = probe.atom;
+fn match_special_token_recur(
+    input: RecurInput<GemmaAddedToken>,
+    state: RecurState<SpecialMatchState>,
+    context: SegmentAtomContext,
+) -> RecurControl<RecurState<SpecialMatchState>> {
+    let token = input.into_value();
     let mut state = state;
+
+    if !context.at_cursor || context.atom_is_end || state.matched {
+        return RecurControl::Break(state);
+    }
+
+    if context.atom_window.starts_with(token.content.as_str()) {
+        state.matched = true;
+        state.matched_special = special_segment_from_token(&token);
+        state.matched_len = token.content.len();
+        return RecurControl::Break(state);
+    }
+
+    RecurControl::Continue(state)
+}
+
+#[tile]
+fn commit_segment_state_tile(
+    state: SegmentState,
+    context: SegmentAtomContext,
+    special_match: SpecialMatchState,
+) -> SegmentState {
+    let mut state = state;
+
+    if !context.at_cursor {
+        return state;
+    }
+
+    if context.atom_is_end {
+        state.pending_text.clear();
+        return state;
+    }
+
+    if special_match.matched {
+        state.pending_text.clear();
+        state.cursor = context.atom_byte_start + special_match.matched_len;
+    } else {
+        state.pending_text.push_str(context.atom_text.as_str());
+        state.cursor = context.atom_byte_end;
+    }
+
+    state
+}
+
+#[tile]
+fn commit_segment_output_tile(
+    output: Draft<InputSegments>,
+    state: SegmentState,
+    context: SegmentAtomContext,
+    special_match: SpecialMatchState,
+) -> Draft<InputSegments> {
     let mut output = output;
 
-    if atom.byte_start != state.cursor {
-        return RecurControl::Continue((state, output));
+    if !context.at_cursor {
+        return output;
     }
 
-    if atom.is_end {
+    if context.atom_is_end {
         if !state.pending_text.is_empty() {
-            output.segments().push(RasterInputSegment {
-                is_special: false,
-                special: SpecialSegment::default(),
-                text: core::mem::take(&mut state.pending_text),
-            });
+            output
+                .segments()
+                .push(InputSegment::Text(state.pending_text));
         }
-        return RecurControl::Break((state, output));
+        return output;
     }
 
-    if probe.is_first_for_atom {
-        state.matched = false;
-        state.matched_special = SpecialSegment::default();
-        state.matched_len = 0;
-    }
-
-    if probe.has_special_token
-        && !state.matched
-        && atom.window.starts_with(probe.token_content.as_str())
-    {
-        state.matched = true;
-        state.matched_special = probe.special;
-        state.matched_len = probe.token_content.len();
-    }
-
-    if !probe.is_last_for_atom {
-        return RecurControl::Continue((state, output));
-    }
-
-    if state.matched {
+    if special_match.matched {
         if !state.pending_text.is_empty() {
-            output.segments().push(RasterInputSegment {
-                is_special: false,
-                special: SpecialSegment::default(),
-                text: core::mem::take(&mut state.pending_text),
-            });
+            output
+                .segments()
+                .push(InputSegment::Text(state.pending_text));
         }
-
-        state.cursor = atom.byte_start + state.matched_len;
-        output.segments().push(RasterInputSegment {
-            is_special: true,
-            special: core::mem::take(&mut state.matched_special),
-            text: String::new(),
-        });
-    } else {
-        state.pending_text.push_str(atom.text.as_str());
-        state.cursor = atom.byte_end;
+        output
+            .segments()
+            .push(InputSegment::Special(special_match.matched_special));
     }
 
-    state.matched = false;
-    state.matched_len = 0;
-
-    RecurControl::Continue((state, output))
+    output
 }
 
 fn normalize_text_segment_impl(
@@ -1053,6 +1034,40 @@ fn select_encoding_view(tokenizer: GemmaTokenizer) -> Result<EncodingTokenizerVi
     )
 }
 
+#[sequence(kind = recur)]
+fn segment_atom_sequence(
+    atom: RecurSequenceInput<PromptAtom>,
+    state: RecurSequenceState<SegmentState>,
+    output: RecurSequenceOutput<InputSegments>,
+    special_tokens: Vec<GemmaAddedToken>,
+) -> (
+    RecurSequenceState<SegmentState>,
+    RecurSequenceOutput<InputSegments>,
+) {
+    let context = call!(segment_atom_context_tile, atom, state.clone());
+    let special_match = call_recur!(
+        tile = match_special_token_recur,
+        input = special_tokens,
+        state = SpecialMatchState::default(),
+        args = (context.clone(),)
+    );
+    let next_state = call!(
+        commit_segment_state_tile,
+        state.clone(),
+        context.clone(),
+        special_match.clone()
+    );
+    let output = call!(
+        commit_segment_output_tile,
+        output,
+        state,
+        context,
+        special_match
+    );
+
+    (next_state, output)
+}
+
 #[sequence]
 fn segment_prompt(tokenizer: GemmaTokenizer, input: String) -> Vec<InputSegment> {
     let special_tokens = select!(Vec<GemmaAddedToken>, tokenizer.special_tokens);
@@ -1063,6 +1078,7 @@ fn segment_prompt(tokenizer: GemmaTokenizer, input: String) -> Vec<InputSegment>
         args = ()
     );
     let max_special_len = select!(usize, max_special_len_state.max_len);
+    // TODO: no iterator over String type
     let prompt_chars = call!(prompt_chars_tile, input);
     let atomized = call_recur!(
         tile = atomize_prompt_recur,
@@ -1074,26 +1090,15 @@ fn segment_prompt(tokenizer: GemmaTokenizer, input: String) -> Vec<InputSegment>
         args = (max_special_len,)
     );
     let atoms = select!(Vec<PromptAtom>, atomized.atoms);
-    let probes = call!(segment_probes_tile, atoms, special_tokens);
-    let segmented = call_recur!(
-        tile = segment_probe_recur,
-        input = probes,
-        state = SegmentProbeState {
+    let segments = call_recur_seq!(
+        sequence = segment_atom_sequence,
+        input = atoms,
+        state = SegmentState {
             cursor: 0,
             pending_text: String::new(),
-            matched: false,
-            matched_special: SpecialSegment::default(),
-            matched_len: 0,
         },
-        output = new!(SegmentedInput),
-        args = ()
-    );
-    let raster_segments = select!(Vec<RasterInputSegment>, segmented.segments);
-    let segments = call_recur!(
-        tile = raster_input_segment_recur,
-        input = raster_segments,
         output = new!(InputSegments),
-        args = ()
+        args = (special_tokens,)
     );
     select!(Vec<InputSegment>, segments.segments)
 }
