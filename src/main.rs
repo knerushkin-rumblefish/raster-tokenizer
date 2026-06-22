@@ -11,5 +11,5 @@ fn main() {
     let encoded = call_seq!(encode_prompt_raster_sequence, tokenizer, prompt)
         .expect("failed to encode prompt");
 
-    debug!("Encoded: {:?}", encoded);
+    raster::println!("Encoded: {:?}", encoded);
 }
