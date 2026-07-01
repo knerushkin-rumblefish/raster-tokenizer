@@ -18,20 +18,45 @@ If your local Raster checkout lives somewhere else, update the `raster` path in 
 
 ## Prepare Input Files
 
-Generate the rasterized tokenizer plus the input files expected by `cargo raster`:
+Generate every artifact expected by `cargo raster`:
 
 ```sh
-cargo run --features encode --bin encode_tokenizer -- . tokenizer.json "Hello from Raster"
+cargo run --features encode --bin generate_input_artifacts -- all . tokenizer.json "Hello from Raster"
 ```
 
-The command above writes these files into the repository root:
+For compatibility, the old positional forms still do the same full generation:
 
-- `tokenizer.json`: source tokenizer model consumed by `bin/encode_tokenizer.rs`
+```sh
+cargo run --features encode --bin generate_input_artifacts -- tokenizer.json "Hello from Raster"
+```
+
+The full command writes these files into the repository root:
+
+- `tokenizer.json`: source tokenizer model consumed by `bin/generate_input_artifacts.rs`
 - `tokenizer.rastered`: rasterized tokenizer data
 - `tokenizer.rindex`: index file for the rasterized tokenizer
 - `prompt.bin`: postcard-encoded prompt string
 - `input.json`: maps Raster inputs named `tokenizer` and `prompt` to the files above
 - `input_manifest.json`: public commitments for the files referenced by `input.json`
+
+Rasterizing the tokenizer can be slow, so prompt generation and tokenizer
+generation can run as separate phases. To generate or update only the prompt
+artifacts:
+
+```sh
+cargo run --features encode --bin generate_input_artifacts -- prompt . "Hello from Raster"
+```
+
+To generate or update only the tokenizer raster and index artifacts:
+
+```sh
+cargo run --features encode --bin generate_input_artifacts -- tokenizer . tokenizer.json
+```
+
+Each phase updates its own entries in `input.json` and `input_manifest.json`, so
+rerun `prompt` when the prompt changes and `tokenizer` when `tokenizer.json`
+changes. The older `inputs` command name is still accepted as an alias for
+`prompt`.
 
 `src/main.rs` reads the logical inputs named `tokenizer` and `prompt`, so the filenames referenced from `input.json` need to stay aligned with those generated outputs.
 
@@ -105,4 +130,4 @@ input.json
 input_manifest.json
 ```
 
-If you change the tokenizer JSON or the prompt text, rerun the `encode_tokenizer` command to regenerate the raster and manifest files before running `cargo raster` again.
+If you change the tokenizer JSON or the prompt text, rerun the `generate_input_artifacts` command to regenerate the raster and manifest files before running `cargo raster` again.
